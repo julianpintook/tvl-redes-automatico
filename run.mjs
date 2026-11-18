@@ -7,7 +7,7 @@ import admin from 'firebase-admin';
 import webpush from 'web-push';
 import { createHash, randomBytes } from 'node:crypto';
 import { addDays, startOfWeek } from './lib/dates.js';
-import { BASE_WEEK, DEFAULT_TIMES, SHIFTS, WORKING, resolveShift, scheduleDocId } from './lib/shifts.js';
+import { BASE_WEEK, COVERAGE_TYPES, DEFAULT_TIMES, SHIFTS, WORKING, resolveShift, scheduleDocId } from './lib/shifts.js';
 import { MONTHS, daysUntil, nextBirthday } from './lib/birthdays.js';
 import { periodLabel, periodOf, periodRange } from './lib/overtime.js';
 
@@ -121,7 +121,7 @@ async function reminders() {
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
 const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
 async function loadScheduleData(from, to) {
-  const [schedules, weekendCfg, holidays, vacations, events, reps, settings] = await Promise.all([
+  const [schedules, weekendCfg, holidays, vacations, events, reps, settings, covers] = await Promise.all([
     snap(db.collection('schedules')),
     snap(db.collection('weekend_config')),
     snap(db.collection('holidays').where('date', '>=', from)),
@@ -129,6 +129,7 @@ async function loadScheduleData(from, to) {
     snap(db.collection('events').where('date', '>=', addDays(from, -7))),
     snap(db.collection('replacements').where('endDate', '>=', from)),
     db.collection('settings').doc('shifts').get(),
+    snap(db.collection('cover_requests').where('date', '>=', from)),
   ]);
   const scheduleById = Object.fromEntries(schedules.map((x) => [x.id, x]));
   const weekendBy = Object.fromEntries(weekendCfg.map((w) => [w.id, w]));
@@ -143,6 +144,7 @@ async function loadScheduleData(from, to) {
       weekendConfig: weekendBy[uid],
       holiday: holidayBy[d],
       vacations,
+      covers,
       defaults,
     });
   return { vacations, events: events.filter((e) => (e.endDate || e.date) >= from && e.date <= to), reps, holidayBy, shiftOf };
@@ -166,7 +168,7 @@ async function weeklySummary() {
       else if (sh.shift === 'off') txt = 'Franco';
       else txt = 'Sin asignar';
       if (sh.shift !== 'none') anything = true;
-      if (sh.coverage?.start) txt += ` + ${sh.coverage.type === 'match' ? 'Partido' : 'Extensión'} ${sh.coverage.start} a ${sh.coverage.end}`;
+      if (sh.coverage?.start) txt += ` + ${COVERAGE_TYPES[sh.coverage.type]?.short || 'Cobertura'} ${sh.coverage.start} a ${sh.coverage.end}`;
       lines.push(`${label}: ${txt}`);
     }
     const ev = data.events.filter((e) => (e.assigneeIds || []).includes(u.id));
@@ -253,7 +255,7 @@ async function calendars() {
       const s = data.shiftOf(u.id, d);
       if (WORKING.has(s.shift) && s.start) ev.push(vevent({ uid: `turno-${u.id}-${d}`, summary: `Turno ${SHIFTS[s.shift].label}`, description: s.note, date: d, start: s.start, end: s.end }));
       if (s.shift === 'holiday_off') ev.push(vevent({ uid: `feriado-${u.id}-${d}`, summary: `Feriado: ${holidayBy[d]?.name || ''}`, date: d }));
-      if (s.coverage?.start) ev.push(vevent({ uid: `cobertura-${u.id}-${d}`, summary: s.coverage.type === 'match' ? `Partido${s.coverage.note ? `: ${s.coverage.note}` : ''}` : `Extensión de horario${s.coverage.note ? `: ${s.coverage.note}` : ''}`, date: d, start: s.coverage.start, end: s.coverage.end }));
+      if (s.coverage?.start) ev.push(vevent({ uid: `cobertura-${u.id}-${d}`, summary: `${COVERAGE_TYPES[s.coverage.type]?.label || 'Cobertura'}${s.coverage.note ? `: ${s.coverage.note}` : ''}`, date: d, start: s.coverage.start, end: s.coverage.end }));
     }
     vacations
       .filter((v) => v.userId === u.id && v.endDate >= from)
