@@ -116,6 +116,17 @@ async function reminders() {
     if (days === 0 && NOW.hour >= 8) await remindOnce(`bday_${b.id}_${year}_dia`, who, `🎂 Hoy cumple ${who2}`, `Preparar el saludo para ${where}.`, '/cumpleanos');
     if (days === 7 && NOW.hour >= 9) await remindOnce(`bday_${b.id}_${year}_semana`, who, `🎂 En una semana cumple ${who2}`, `${b.day} de ${MONTHS[b.month - 1]} · ${where}.`, '/cumpleanos');
   }
+
+  // Cumpleaños de integrantes del equipo: saludo a la persona y aviso al resto para que le deje un mensaje.
+  if (NOW.hour >= 8) {
+    for (const u of team) {
+      if (!u.birthDay || !u.birthMonth || daysUntil(u.birthDay, u.birthMonth, TODAY) !== 0) continue;
+      const year = TODAY.slice(0, 4);
+      const nombre = u.firstName || (u.displayName || '').split(' ')[0];
+      await remindOnce(`team_bday_${u.id}_${year}_saludo`, [u.id], `🎂 ¡Feliz cumple, ${nombre}!`, 'Todo el equipo de Redes te desea un día hermoso. Mirá tus mensajitos en el Inicio.', '/');
+      await remindOnce(`team_bday_${u.id}_${year}_equipo`, team.filter((x) => x.id !== u.id).map((x) => x.id), `🎉 Hoy cumple ${u.displayName}`, `Dejale un mensajito de feliz cumple en el Inicio.`, '/');
+    }
+  }
 }
 
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
