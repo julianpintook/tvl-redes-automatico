@@ -118,6 +118,67 @@ async function reminders() {
   }
 }
 
+// ---------------- 1b) Resumen de la semana (lunes) ----------------
+const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
+async function loadScheduleData(from, to) {
+  const [schedules, weekendCfg, holidays, vacations, events, reps, settings] = await Promise.all([
+    snap(db.collection('schedules')),
+    snap(db.collection('weekend_config')),
+    snap(db.collection('holidays').where('date', '>=', from)),
+    snap(db.collection('vacations').where('status', '==', 'approved')),
+    snap(db.collection('events').where('date', '>=', addDays(from, -7))),
+    snap(db.collection('replacements').where('endDate', '>=', from)),
+    db.collection('settings').doc('shifts').get(),
+  ]);
+  const scheduleById = Object.fromEntries(schedules.map((x) => [x.id, x]));
+  const weekendBy = Object.fromEntries(weekendCfg.map((w) => [w.id, w]));
+  const holidayBy = Object.fromEntries(holidays.map((h) => [h.date, h]));
+  const defaults = { ...DEFAULT_TIMES, ...(settings.exists ? settings.data().times || {} : {}) };
+  const shiftOf = (uid, d) =>
+    resolveShift({
+      userId: uid,
+      date: d,
+      baseSchedule: scheduleById[scheduleDocId(uid, BASE_WEEK)],
+      weekSchedule: scheduleById[scheduleDocId(uid, startOfWeek(d))],
+      weekendConfig: weekendBy[uid],
+      holiday: holidayBy[d],
+      vacations,
+      defaults,
+    });
+  return { vacations, events: events.filter((e) => (e.endDate || e.date) >= from && e.date <= to), reps, holidayBy, shiftOf };
+}
+
+async function weeklySummary() {
+  const weekStart = startOfWeek(TODAY);
+  if (TODAY !== weekStart || NOW.hour < 8) return;
+  const weekEnd = addDays(weekStart, 6);
+  const data = await loadScheduleData(weekStart, weekEnd);
+  for (const u of team) {
+    const lines = [];
+    let anything = false;
+    for (let d = weekStart; d <= weekEnd; d = addDays(d, 1)) {
+      const sh = data.shiftOf(u.id, d);
+      const label = `${DAY_SHORT[['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][new Date(`${d}T12:00:00-03:00`).getUTCDay()]]} ${Number(d.slice(8))}`;
+      let txt;
+      if (WORKING.has(sh.shift)) txt = `${SHIFTS[sh.shift].label} ${sh.start} a ${sh.end}`;
+      else if (sh.shift === 'vacation') txt = 'Vacaciones';
+      else if (sh.shift === 'holiday_off') txt = `Feriado${data.holidayBy[d] ? ` (${data.holidayBy[d].name})` : ''}`;
+      else if (sh.shift === 'off') txt = 'Franco';
+      else txt = 'Sin asignar';
+      if (sh.shift !== 'none') anything = true;
+      if (sh.coverage?.start) txt += ` + ${sh.coverage.type === 'match' ? 'Partido' : 'Extensión'} ${sh.coverage.start} a ${sh.coverage.end}`;
+      lines.push(`${label}: ${txt}`);
+    }
+    const ev = data.events.filter((e) => (e.assigneeIds || []).includes(u.id));
+    ev.forEach((e) => lines.push(`⭐ ${Number(e.date.slice(8))}/${Number(e.date.slice(5, 7))}: ${e.name}${e.start ? ` ${e.start}` : ''}`));
+    data.reps
+      .filter((r) => r.replacementUserId === u.id && r.startDate <= weekEnd)
+      .forEach((r) => lines.push(`Reemplazás a ${name(r.absentUserId)} hasta el ${Number(r.endDate.slice(8))}/${Number(r.endDate.slice(5, 7))}`));
+    if (!anything && !ev.length) continue;
+    await remindOnce(`semana_${weekStart}_${u.id}`, [u.id], 'Tu semana', lines.join('\n'), '/grilla');
+  }
+}
+
 // ---------------- 2) Push ----------------
 const subsCache = {};
 async function subsOf(uid) {
@@ -181,34 +242,14 @@ async function calendars() {
   if (!GIST_TOKEN) return;
   const from = addDays(TODAY, -14);
   const to = addDays(TODAY, 75);
-  const [schedules, weekendCfg, holidays, vacations, events, reps, settings] = await Promise.all([
-    snap(db.collection('schedules')),
-    snap(db.collection('weekend_config')),
-    snap(db.collection('holidays').where('date', '>=', from)),
-    snap(db.collection('vacations').where('status', '==', 'approved')),
-    snap(db.collection('events').where('date', '>=', from)),
-    snap(db.collection('replacements').where('endDate', '>=', from)),
-    db.collection('settings').doc('shifts').get(),
-  ]);
-  const scheduleById = Object.fromEntries(schedules.map((s) => [s.id, s]));
-  const weekendBy = Object.fromEntries(weekendCfg.map((w) => [w.id, w]));
-  const holidayBy = Object.fromEntries(holidays.map((h) => [h.date, h]));
-  const defaults = { ...DEFAULT_TIMES, ...(settings.exists ? settings.data().times || {} : {}) };
+  const data = await loadScheduleData(from, to);
+  const { vacations, events, reps, holidayBy } = data;
   const me = await gistApi('GET', '/user');
 
   for (const u of team) {
     const ev = [];
     for (let d = from; d <= to; d = addDays(d, 1)) {
-      const s = resolveShift({
-        userId: u.id,
-        date: d,
-        baseSchedule: scheduleById[scheduleDocId(u.id, BASE_WEEK)],
-        weekSchedule: scheduleById[scheduleDocId(u.id, startOfWeek(d))],
-        weekendConfig: weekendBy[u.id],
-        holiday: holidayBy[d],
-        vacations,
-        defaults,
-      });
+      const s = data.shiftOf(u.id, d);
       if (WORKING.has(s.shift) && s.start) ev.push(vevent({ uid: `turno-${u.id}-${d}`, summary: `Turno ${SHIFTS[s.shift].label}`, description: s.note, date: d, start: s.start, end: s.end }));
       if (s.shift === 'holiday_off') ev.push(vevent({ uid: `feriado-${u.id}-${d}`, summary: `Feriado: ${holidayBy[d]?.name || ''}`, date: d }));
       if (s.coverage?.start) ev.push(vevent({ uid: `cobertura-${u.id}-${d}`, summary: s.coverage.type === 'match' ? `Partido${s.coverage.note ? `: ${s.coverage.note}` : ''}` : `Extensión de horario${s.coverage.note ? `: ${s.coverage.note}` : ''}`, date: d, start: s.coverage.start, end: s.coverage.end }));
@@ -243,22 +284,7 @@ async function calendars() {
   }
 }
 
-// ---------------- Mantener vivo el proceso ----------------
-// GitHub pausa los procesos programados de repos sin actividad en 60 días: una vez por mes se registra la última ejecución.
-async function keepAlive() {
-  const repo = process.env.GITHUB_REPOSITORY;
-  if (!GIST_TOKEN || !repo || Number(TODAY.slice(8)) !== 1 || NOW.hour !== 4) return;
-  const path = `/repos/${repo}/contents/ultima-actividad.txt`;
-  let sha;
-  try {
-    sha = (await gistApi('GET', path)).sha;
-  } catch {
-    /* no existe todavía */
-  }
-  await gistApi('PUT', path, { message: `Actividad ${TODAY}`, content: Buffer.from(`Última actividad: ${TODAY}\n`).toString('base64'), sha });
-}
-
-const steps = { reminders, pushPending, calendars, keepAlive };
+const steps = { reminders, weeklySummary, pushPending, calendars };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
