@@ -200,6 +200,7 @@ async function pushPending() {
           if (e.statusCode === 404 || e.statusCode === 410) {
             await db.collection('users').doc(uid).collection('pushSubs').doc(s.id).delete();
             subsCache[uid] = subsCache[uid].filter((x) => x.id !== s.id);
+            await db.collection('users').doc(uid).update({ pushDevices: subsCache[uid].length }).catch(() => {});
             stats.subsRemoved++;
           } else stats.pushFail++;
         }
@@ -284,11 +285,19 @@ async function calendars() {
   }
 }
 
-const steps = { reminders, weeklySummary, pushPending, calendars };
+/** Mantiene actualizado en cada perfil cuántos dispositivos tienen avisos activados (lo ve el admin). */
+async function syncDevices() {
+  for (const u of team) {
+    const n = (await subsOf(u.id)).length;
+    if (u.pushDevices !== n) await db.collection('users').doc(u.id).update({ pushDevices: n });
+  }
+}
+
+const steps = { reminders, weeklySummary, pushPending, calendars, syncDevices };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
-  if (k === 'calendars' && NOW.minute >= 10 && !process.env.FORCE_CALENDARS) continue;
+  if ((k === 'calendars' || k === 'syncDevices') && NOW.minute >= 10 && !process.env.FORCE_CALENDARS) continue;
   try {
     await fn();
   } catch (e) {
