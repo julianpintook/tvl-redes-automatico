@@ -10,6 +10,7 @@ import { addDays, dayKeyOf, startOfWeek } from './lib/dates.js';
 import { BASE_WEEK, COVERAGE_TYPES, DEFAULT_TIMES, SHIFTS, WORKING, resolveShift, scheduleDocId } from './lib/shifts.js';
 import { MONTHS, daysUntil, nextBirthday } from './lib/birthdays.js';
 import { periodLabel, periodOf, periodRange } from './lib/overtime.js';
+import { findGaps, gapText } from './lib/gaps.js';
 
 const TZ = 'America/Argentina/Buenos_Aires';
 const APP_URL = 'https://tvl-redes.web.app';
@@ -297,6 +298,17 @@ async function calendars() {
   }
 }
 
+// ---------------- 1b2) Huecos en la grilla (aviso a los administradores, una vez por día con hueco) ----------------
+async function gapAlerts() {
+  if (NOW.hour < 9 || !admins.length) return;
+  const data = await loadScheduleData(TODAY, addDays(TODAY, 7));
+  const ignoredDoc = await db.collection('settings').doc('gaps').get();
+  const ignored = ignoredDoc.exists ? ignoredDoc.data().ignored || [] : [];
+  const gaps = findGaps({ teamIds: team.map((u) => u.id), shiftOf: data.shiftOf, from: TODAY, days: 7 }).filter((g) => !ignored.includes(g.date));
+  for (const g of gaps)
+    await remindOnce(`gap_${g.date}`, admins.map((a) => a.id), `⚠️ Hueco en la grilla: ${fmt(g.date)}`, `Ese día ${gapText(g)}.`, '/grilla');
+}
+
 // ---------------- 1c) Pase de tareas en vacaciones ----------------
 // Mientras alguien está de vacaciones, sus tareas abiertas pasan a quien lo reemplaza; al volver, se le devuelven.
 const fmtShort = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
@@ -371,7 +383,7 @@ async function syncDevices() {
   }
 }
 
-const steps = { reminders, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
+const steps = { reminders, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
