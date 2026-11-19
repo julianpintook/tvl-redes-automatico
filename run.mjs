@@ -298,6 +298,27 @@ async function calendars() {
   }
 }
 
+// ---------------- 1b1) Aviso la tarde anterior a un feriado que la persona trabaja ----------------
+async function holidayEve() {
+  if (NOW.hour < 18) return;
+  const hs = await snap(db.collection('holidays').where('date', '==', TOMORROW));
+  if (!hs.length) return;
+  const data = await loadScheduleData(TOMORROW, TOMORROW);
+  for (const h of hs) {
+    const slots = [
+      [h.morningUserId, 'Turno Mañana'],
+      [h.afternoonUserId, 'Turno Tarde'],
+      [h.reinforcementEnabled && h.reinforcementUserId, h.reinforcementSlot === 'midday' ? 'Refuerzo Mediodía' : 'Refuerzo'],
+    ].filter(([u]) => u);
+    for (const [uid, slot] of slots) {
+      const s = data.shiftOf(uid, TOMORROW);
+      if (s.shift === 'vacation') continue;
+      const hours = s.start ? `, de ${s.start} a ${s.end}` : '';
+      await remindOnce(`holiday_eve_${h.date}_${uid}`, [uid], `Mañana trabajás el feriado: ${h.name}`, `${slot}${hours}.`, '/feriados');
+    }
+  }
+}
+
 // ---------------- 1b2) Huecos en la grilla (aviso a los administradores, una vez por día con hueco) ----------------
 async function gapAlerts() {
   if (NOW.hour < 9 || !admins.length) return;
@@ -383,7 +404,7 @@ async function syncDevices() {
   }
 }
 
-const steps = { reminders, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
+const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
