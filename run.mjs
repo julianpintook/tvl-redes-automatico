@@ -6,7 +6,7 @@
 import admin from 'firebase-admin';
 import webpush from 'web-push';
 import { createHash, randomBytes } from 'node:crypto';
-import { addDays, startOfWeek } from './lib/dates.js';
+import { addDays, dayKeyOf, startOfWeek } from './lib/dates.js';
 import { BASE_WEEK, COVERAGE_TYPES, DEFAULT_TIMES, SHIFTS, WORKING, resolveShift, scheduleDocId } from './lib/shifts.js';
 import { MONTHS, daysUntil, nextBirthday } from './lib/birthdays.js';
 import { periodLabel, periodOf, periodRange } from './lib/overtime.js';
@@ -297,6 +297,72 @@ async function calendars() {
   }
 }
 
+// ---------------- 1c) Pase de tareas en vacaciones ----------------
+// Mientras alguien está de vacaciones, sus tareas abiertas pasan a quien lo reemplaza; al volver, se le devuelven.
+const fmtShort = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+const note = (userId, title, body, link) =>
+  db.collection('notifications').doc().set({ userId, type: 'tasks_handover', title, body, link, read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() });
+
+async function taskHandover() {
+  const reps = await snap(db.collection('replacements').where('endDate', '>=', addDays(TODAY, -90)));
+  const repById = Object.fromEntries(reps.map((r) => [r.id, r]));
+  const isActive = (r) => r && r.startDate <= TODAY && r.endDate >= TODAY;
+
+  // Devolver: el reemplazo terminó o se borró.
+  const covered = await snap(db.collection('tasks').where('coverReplacementId', '>', ''));
+  const back = covered.filter((t) => !isActive(repById[t.coverReplacementId]));
+  const returned = {};
+  for (const t of back) {
+    const giveBack = t.status !== 'done' && t.assigneeId === t.coverBy;
+    await db.collection('tasks').doc(t.id).update({
+      ...(giveBack ? { assigneeId: t.coveredFrom } : {}),
+      coveredFrom: FieldValue.delete(),
+      coverBy: FieldValue.delete(),
+      coverReplacementId: FieldValue.delete(),
+      coverUntil: FieldValue.delete(),
+    });
+    if (giveBack) (returned[t.coveredFrom] ||= []).push(t.title);
+  }
+  for (const [uid, titles] of Object.entries(returned))
+    await note(uid, `👋 ¡Bienvenido/a! Te devolvimos ${titles.length} tarea(s)`, titles.slice(0, 6).map((x) => `• ${x}`).join('\n'), '/tareas');
+
+  // Pasar: reemplazos vigentes hoy.
+  for (const r of reps.filter(isActive)) {
+    const open = (await snap(db.collection('tasks').where('assigneeId', '==', r.absentUserId))).filter((t) => t.status !== 'done');
+    if (!open.length) continue;
+    const batch = db.batch();
+    open.forEach((t) => batch.update(db.collection('tasks').doc(t.id), { assigneeId: r.replacementUserId, coveredFrom: r.absentUserId, coverBy: r.replacementUserId, coverReplacementId: r.id, coverUntil: r.endDate }));
+    await batch.commit();
+    await note(
+      r.replacementUserId,
+      `📋 Te pasaron ${open.length} tarea(s) de ${name(r.absentUserId)}`,
+      `Mientras está de vacaciones (hasta el ${fmtShort(r.endDate)}):\n${open.slice(0, 6).map((t) => `• ${t.title}`).join('\n')}${open.length > 6 ? `\n…y ${open.length - 6} más` : ''}`,
+      '/tareas'
+    );
+  }
+}
+
+// ---------------- 1d) Post-its con recordatorio ----------------
+async function postitReminders() {
+  const list = await snap(db.collection('postits').where('active', '==', true));
+  const nowMin = NOW.hour * 60 + NOW.minute;
+  const dk = dayKeyOf(TODAY);
+  for (const p of list) {
+    if (!p.time || p.lastFired === TODAY) continue;
+    const [h, m] = p.time.split(':').map(Number);
+    const diff = nowMin - (h * 60 + m);
+    if (diff < 0 || diff > 90) continue; // si el proceso se demoró más de 90 min, no avisa tarde
+    const rep = p.repeat || 'once';
+    if (rep === 'once' && p.date !== TODAY) continue;
+    if (rep === 'weekdays' && (dk === 'sat' || dk === 'sun')) continue;
+    if (rep === 'weekly' && !(p.days || []).includes(dk)) continue;
+    const text = String(p.text || '');
+    await db.collection('notifications').doc().set({ userId: p.ownerId, type: 'postit', title: `📌 ${text.length > 70 ? `${text.slice(0, 67)}…` : text}`, body: text.length > 70 ? text : 'Tu recordatorio de ahora.', link: '/', read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() });
+    await db.collection('postits').doc(p.id).update({ lastFired: TODAY });
+    stats.reminders++;
+  }
+}
+
 /** Mantiene actualizado en cada perfil cuántos dispositivos tienen avisos activados (lo ve el admin). */
 async function syncDevices() {
   for (const u of team) {
@@ -305,7 +371,7 @@ async function syncDevices() {
   }
 }
 
-const steps = { reminders, weeklySummary, pushPending, calendars, syncDevices };
+const steps = { reminders, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
