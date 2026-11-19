@@ -11,6 +11,7 @@ import { BASE_WEEK, COVERAGE_TYPES, DEFAULT_TIMES, SHIFTS, WORKING, resolveShift
 import { MONTHS, daysUntil, nextBirthday } from './lib/birthdays.js';
 import { periodLabel, periodOf, periodRange } from './lib/overtime.js';
 import { findGaps, gapText } from './lib/gaps.js';
+import { wantsPush } from './lib/notifPrefs.js';
 
 const TZ = 'America/Argentina/Buenos_Aires';
 const APP_URL = 'https://tvl-redes.web.app';
@@ -51,14 +52,14 @@ const byUid = Object.fromEntries(users.map((u) => [u.id, u]));
 const name = (uid) => byUid[uid]?.displayName || 'un compañero';
 
 /** Crea avisos en la app (una sola vez por clave). Después el paso de push los envía. */
-async function remindOnce(key, to, title, body, link) {
+async function remindOnce(key, to, title, body, link, category = null) {
   const ref = db.collection('reminders_sent').doc(key);
   if ((await ref.get()).exists) return;
   const targets = [...new Set(to.filter(Boolean))];
   if (!targets.length) return;
   const batch = db.batch();
   targets.forEach((userId) =>
-    batch.set(db.collection('notifications').doc(), { userId, type: 'reminder', title, body, link, read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() })
+    batch.set(db.collection('notifications').doc(), { userId, type: 'reminder', category, title, body, link, read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() })
   );
   batch.set(ref, { at: FieldValue.serverTimestamp(), count: targets.length });
   await batch.commit();
@@ -72,13 +73,13 @@ async function reminders() {
   for (const e of events) {
     const who = e.assigneeIds || [];
     const detail = `${e.start ? `${e.start}${e.end ? ` a ${e.end}` : ''} hs` : 'Horario a confirmar'}${e.location ? ` · ${e.location}` : ''}\nCuentas: ${(e.accounts || []).join(', ')}`;
-    if (e.date === TOMORROW && NOW.hour >= 9) await remindOnce(`event_${e.id}_${e.date}_manana`, who, `Mañana: ${e.name}`, detail, '/eventos');
+    if (e.date === TOMORROW && NOW.hour >= 9) await remindOnce(`event_${e.id}_${e.date}_manana`, who, `Mañana: ${e.name}`, detail, '/eventos', 'eventos');
     if (e.date === TODAY) {
       if (e.start) {
         const [h, m] = e.start.split(':').map(Number);
         const minsTo = h * 60 + m - (NOW.hour * 60 + NOW.minute);
-        if (minsTo <= 120 && minsTo > -30) await remindOnce(`event_${e.id}_${e.date}_pronto`, who, `Hoy a las ${e.start}: ${e.name}`, detail, '/eventos');
-      } else if (NOW.hour >= 8) await remindOnce(`event_${e.id}_${e.date}_hoy`, who, `Hoy: ${e.name}`, detail, '/eventos');
+        if (minsTo <= 120 && minsTo > -30) await remindOnce(`event_${e.id}_${e.date}_pronto`, who, `Hoy a las ${e.start}: ${e.name}`, detail, '/eventos', 'eventos');
+      } else if (NOW.hour >= 8) await remindOnce(`event_${e.id}_${e.date}_hoy`, who, `Hoy: ${e.name}`, detail, '/eventos', 'eventos');
     }
   }
 
@@ -103,7 +104,7 @@ async function reminders() {
     const r = periodRange(period);
     const label = periodLabel(period);
     const txt = `Período ${label}: del ${fmt(r.start, { day: 'numeric', month: 'numeric' })} al ${fmt(r.end, { day: 'numeric', month: 'numeric' })}. Revisá que tengas todas tus horas extras cargadas.`;
-    await remindOnce(`ot_cierre_${period}_${day}`, team.map((u) => u.id), day === 14 ? 'Mañana cierra el período de horas extras' : 'Hoy cierra el período de horas extras', txt, '/horas-extras');
+    await remindOnce(`ot_cierre_${period}_${day}`, team.map((u) => u.id), day === 14 ? 'Mañana cierra el período de horas extras' : 'Hoy cierra el período de horas extras', txt, '/horas-extras', 'horas');
   }
 
   // Cumpleaños: una semana antes y el mismo día, a quien cubre esas cuentas
@@ -114,8 +115,8 @@ async function reminders() {
     const who = team.filter((u) => (u.assignedChannels || []).some((a) => (b.accounts || []).includes(a))).map((u) => u.id);
     const who2 = `${b.firstName} ${b.lastName}`;
     const where = (b.accounts || []).join(', ');
-    if (days === 0 && NOW.hour >= 8) await remindOnce(`bday_${b.id}_${year}_dia`, who, `🎂 Hoy cumple ${who2}`, `Preparar el saludo para ${where}.`, '/cumpleanos');
-    if (days === 7 && NOW.hour >= 9) await remindOnce(`bday_${b.id}_${year}_semana`, who, `🎂 En una semana cumple ${who2}`, `${b.day} de ${MONTHS[b.month - 1]} · ${where}.`, '/cumpleanos');
+    if (days === 0 && NOW.hour >= 8) await remindOnce(`bday_${b.id}_${year}_dia`, who, `🎂 Hoy cumple ${who2}`, `Preparar el saludo para ${where}.`, '/cumpleanos', 'cumpleanos');
+    if (days === 7 && NOW.hour >= 9) await remindOnce(`bday_${b.id}_${year}_semana`, who, `🎂 En una semana cumple ${who2}`, `${b.day} de ${MONTHS[b.month - 1]} · ${where}.`, '/cumpleanos', 'cumpleanos');
   }
 
   // Cumpleaños de integrantes del equipo: saludo a la persona y aviso al resto para que le deje un mensaje.
@@ -125,7 +126,7 @@ async function reminders() {
       const year = TODAY.slice(0, 4);
       const nombre = u.firstName || (u.displayName || '').split(' ')[0];
       await remindOnce(`team_bday_${u.id}_${year}_saludo`, [u.id], `🎂 ¡Feliz cumple, ${nombre}!`, 'Todo el equipo de Redes te desea un día hermoso. Mirá tus mensajitos en el Inicio.', '/');
-      await remindOnce(`team_bday_${u.id}_${year}_equipo`, team.filter((x) => x.id !== u.id).map((x) => x.id), `🎉 Hoy cumple ${u.displayName}`, `Dejale un mensajito de feliz cumple en el Inicio.`, '/');
+      await remindOnce(`team_bday_${u.id}_${year}_equipo`, team.filter((x) => x.id !== u.id).map((x) => x.id), `🎉 Hoy cumple ${u.displayName}`, `Dejale un mensajito de feliz cumple en el Inicio.`, '/', 'cumpleanos');
     }
   }
 }
@@ -187,7 +188,7 @@ async function weeklySummary() {
       .filter((r) => r.replacementUserId === u.id && r.startDate <= weekEnd)
       .forEach((r) => lines.push(`Reemplazás a ${name(r.absentUserId)} hasta el ${Number(r.endDate.slice(8))}/${Number(r.endDate.slice(5, 7))}`));
     if (!anything && !ev.length) continue;
-    await remindOnce(`semana_${weekStart}_${u.id}`, [u.id], 'Tu semana', lines.join('\n'), '/grilla');
+    await remindOnce(`semana_${weekStart}_${u.id}`, [u.id], 'Tu semana', lines.join('\n'), '/grilla', 'resumen');
   }
 }
 
@@ -204,6 +205,7 @@ async function pushPending() {
   for (const n of pending) {
     const targets = n.userId === 'role:admin' ? admins.map((a) => a.id) : [n.userId];
     for (const uid of targets) {
+      if (!wantsPush(byUid[uid], n)) continue; // la persona eligió no recibir este tipo en el celular
       for (const s of await subsOf(uid)) {
         try {
           const urgent = n.type === 'urgent_alert';
