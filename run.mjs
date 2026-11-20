@@ -484,6 +484,34 @@ async function cleanup() {
   }
 }
 
+// ---------------- Comunicados programados ----------------
+// La coordinación deja un comunicado (o encuesta) listo en "scheduled_announcements" con fecha y hora;
+// a partir de ese momento se publica en Novedades y se avisa a todo el equipo. Se publica una sola vez.
+async function scheduledAnnouncements() {
+  const due = (await snap(db.collection('scheduled_announcements').where('published', '==', false))).filter(
+    (a) => a.publishDate < TODAY || (a.publishDate === TODAY && (a.publishTime || '00:00') <= NOW.hhmm)
+  );
+  for (const a of due) {
+    const data = { title: a.title, body: a.body || '', pinned: Boolean(a.pinned), createdBy: a.createdBy, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() };
+    if (a.pollOptions?.length >= 2) data.poll = { options: a.pollOptions, closed: false };
+    const ref = await db.collection('announcements').add(data);
+    const batch = db.batch();
+    for (const u of team)
+      batch.set(db.collection('notifications').doc(), {
+        userId: u.id,
+        type: 'announcement',
+        title: data.poll ? `📊 Encuesta: ${a.title}` : `📣 ${a.title}`,
+        body: (a.body || '').length > 280 ? `${a.body.slice(0, 277)}…` : a.body || '',
+        link: '/novedades',
+        read: false,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    batch.update(db.collection('scheduled_announcements').doc(a.id), { published: true, publishedAt: FieldValue.serverTimestamp(), announcementId: ref.id });
+    await batch.commit();
+    stats.reminders += team.length;
+  }
+}
+
 // ---------------- Mantener vivo el proceso ----------------
 // GitHub pausa los procesos programados de repos públicos sin actividad en 60 días:
 // el día 1 de cada mes se deja registrada la última ejecución en este mismo repositorio.
@@ -500,7 +528,7 @@ async function keepAlive() {
   await gistApi('PUT', path, { message: `Actividad ${TODAY}`, content: Buffer.from(`Última actividad: ${TODAY}\n`).toString('base64'), sha });
 }
 
-const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive };
+const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
