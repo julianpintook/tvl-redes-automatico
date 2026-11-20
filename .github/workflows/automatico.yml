@@ -9,6 +9,14 @@ on:
         description: 'Regenerar calendarios ahora'
         type: boolean
         default: false
+      force_backup:
+        description: 'Hacer la copia de seguridad ahora'
+        type: boolean
+        default: false
+      force_cleanup:
+        description: 'Hacer la limpieza ahora'
+        type: boolean
+        default: false
 
 concurrency:
   group: automatico
@@ -17,7 +25,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,3 +40,5 @@ jobs:
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           FORCE_CALENDARS: ${{ inputs.force_calendars && '1' || '' }}
+          FORCE_BACKUP: ${{ inputs.force_backup && '1' || '' }}
+          FORCE_CLEANUP: ${{ inputs.force_cleanup && '1' || '' }}

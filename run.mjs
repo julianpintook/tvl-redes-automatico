@@ -2,6 +2,8 @@
 // 1) Recordatorios: eventos, reemplazos, cierre de horas extras y cumpleaños → crea avisos en la app.
 // 2) Push: envía al celular/compu los avisos nuevos de la app (Web Push).
 // 3) Calendarios: genera el calendario personal (.ics) de cada integrante y lo publica en un Gist secreto.
+// 4) Copia de seguridad: los domingos a la madrugada guarda todos los datos en un repositorio PRIVADO.
+// 5) Limpieza: todos los días borra avisos, mensajes y alertas viejos (para no pasar el límite gratis).
 // Los registros (logs) de este repo son públicos: acá solo se imprimen cantidades, nunca datos personales.
 import admin from 'firebase-admin';
 import webpush from 'web-push';
@@ -41,7 +43,7 @@ const TODAY = NOW.date;
 const TOMORROW = addDays(TODAY, 1);
 const fmt = (iso, opts = { weekday: 'long', day: 'numeric', month: 'long' }) => new Date(`${iso}T12:00:00-03:00`).toLocaleDateString('es-AR', { timeZone: TZ, ...opts });
 
-const stats = { reminders: 0, pushes: 0, pushFail: 0, subsRemoved: 0, calendars: 0 };
+const stats = { backupDocs: 0, cleaned: 0, reminders: 0, pushes: 0, pushFail: 0, subsRemoved: 0, calendars: 0 };
 
 // ---- Datos ----
 const snap = async (q) => (await q.get()).docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -406,7 +408,99 @@ async function syncDevices() {
   }
 }
 
-const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices };
+// ---------------- Copia de seguridad semanal ----------------
+// Se guarda en un repositorio privado (nunca en este, que es público). Cada colección queda en un archivo
+// "ultimo/<coleccion>.json"; el historial de Git conserva las copias de todas las semanas anteriores.
+const BACKUP_REPO = 'julianpintook/tvl-redes-respaldos';
+const serialize = (v) => {
+  if (v === null || v === undefined) return v ?? null;
+  if (v instanceof admin.firestore.Timestamp) return { __ts: v.toDate().toISOString() };
+  if (v instanceof admin.firestore.GeoPoint) return { __geo: [v.latitude, v.longitude] };
+  if (v instanceof admin.firestore.DocumentReference) return { __ref: v.path };
+  if (Buffer.isBuffer(v) || v instanceof Uint8Array) return { __bytes: Buffer.from(v).toString('base64') };
+  if (Array.isArray(v)) return v.map(serialize);
+  if (typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, serialize(x)]));
+  return v;
+};
+async function dumpCollection(ref) {
+  const out = {};
+  for (const d of (await ref.get()).docs) {
+    const sub = {};
+    for (const c of await d.ref.listCollections()) sub[c.id] = await dumpCollection(c);
+    out[d.id] = { data: serialize(d.data()), ...(Object.keys(sub).length ? { sub } : {}) };
+    stats.backupDocs++;
+  }
+  // Documentos "vacíos" que solo tienen subcolecciones
+  for (const d of await ref.listDocuments()) {
+    if (out[d.id]) continue;
+    const sub = {};
+    for (const c of await d.listCollections()) sub[c.id] = await dumpCollection(c);
+    if (Object.keys(sub).length) out[d.id] = { data: null, sub };
+  }
+  return out;
+}
+async function backup() {
+  const sunday = new Date(`${TODAY}T12:00:00-03:00`).getUTCDay() === 0;
+  const due = (sunday && NOW.hour === 3 && NOW.minute < 5) || process.env.FORCE_BACKUP;
+  if (!GIST_TOKEN || !due) return;
+  const files = {};
+  for (const c of await db.listCollections()) files[`ultimo/${c.id}.json`] = JSON.stringify(await dumpCollection(c));
+  files['ultimo/_info.json'] = JSON.stringify({ fecha: new Date().toISOString(), colecciones: Object.keys(files).length, documentos: stats.backupDocs }, null, 2);
+  // Un solo commit con todos los archivos (API de Git de GitHub)
+  const ref = await gistApi('GET', `/repos/${BACKUP_REPO}/git/ref/heads/main`);
+  const parent = await gistApi('GET', `/repos/${BACKUP_REPO}/git/commits/${ref.object.sha}`);
+  const tree = [];
+  for (const [path, content] of Object.entries(files)) {
+    const blob = await gistApi('POST', `/repos/${BACKUP_REPO}/git/blobs`, { content: Buffer.from(content).toString('base64'), encoding: 'base64' });
+    tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+  }
+  const newTree = await gistApi('POST', `/repos/${BACKUP_REPO}/git/trees`, { base_tree: parent.tree.sha, tree });
+  const commit = await gistApi('POST', `/repos/${BACKUP_REPO}/git/commits`, { message: `Copia de seguridad ${TODAY}`, tree: newTree.sha, parents: [parent.sha] });
+  await gistApi('PATCH', `/repos/${BACKUP_REPO}/git/refs/heads/main`, { sha: commit.sha });
+}
+
+// ---------------- Limpieza diaria ----------------
+// Solo cosas de paso: avisos, mensajes del chat, alertas, correos ya enviados y marcas de recordatorios.
+// Nunca toca grilla, eventos, vacaciones, horas extras, comprobantes ni nada de gestión.
+async function cleanup() {
+  if (!(NOW.hour === 4 && NOW.minute < 5) && !process.env.FORCE_CLEANUP) return;
+  const ago = (days) => admin.firestore.Timestamp.fromDate(new Date(Date.now() - days * 864e5));
+  const rules = [
+    ['notifications', 'createdAt', 90], // avisos de más de 3 meses
+    ['chat', 'createdAt', 180], // mensajes del chat de más de 6 meses
+    ['alerts', 'createdAt', 60], // alertas de último momento de más de 2 meses
+    ['mail', 'createdAt', 30], // correos ya despachados
+    ['reminders_sent', 'at', 180], // marcas internas de recordatorios
+  ];
+  for (const [col, field, days] of rules) {
+    for (let round = 0; round < 5; round++) {
+      const docs = (await db.collection(col).where(field, '<', ago(days)).limit(400).get()).docs;
+      if (!docs.length) break;
+      const b = db.batch();
+      docs.forEach((d) => b.delete(d.ref));
+      await b.commit();
+      stats.cleaned += docs.length;
+    }
+  }
+}
+
+// ---------------- Mantener vivo el proceso ----------------
+// GitHub pausa los procesos programados de repos públicos sin actividad en 60 días:
+// el día 1 de cada mes se deja registrada la última ejecución en este mismo repositorio.
+async function keepAlive() {
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!GIST_TOKEN || !repo || Number(TODAY.slice(8)) !== 1 || NOW.hour !== 4 || NOW.minute >= 5) return;
+  const path = `/repos/${repo}/contents/ultima-actividad.txt`;
+  let sha;
+  try {
+    sha = (await gistApi('GET', path)).sha;
+  } catch {
+    /* todavía no existe */
+  }
+  await gistApi('PUT', path, { message: `Actividad ${TODAY}`, content: Buffer.from(`Última actividad: ${TODAY}\n`).toString('base64'), sha });
+}
+
+const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
@@ -418,6 +512,6 @@ for (const [k, fn] of Object.entries(steps)) {
     console.error(`Error en ${k}: ${e.message}`);
   }
 }
-console.log(`Hora AR ${TODAY} ${NOW.hhmm} · recordatorios ${stats.reminders} · push ${stats.pushes} (fallidos ${stats.pushFail}, bajas ${stats.subsRemoved}) · calendarios ${stats.calendars}`);
+console.log(`Hora AR ${TODAY} ${NOW.hhmm} · recordatorios ${stats.reminders} · push ${stats.pushes} (fallidos ${stats.pushFail}, bajas ${stats.subsRemoved}) · calendarios ${stats.calendars} · respaldo ${stats.backupDocs} docs · limpieza ${stats.cleaned}`);
 await Promise.all(admin.apps.map((a) => a.delete()));
 if (failed) process.exit(1);
