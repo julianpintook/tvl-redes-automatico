@@ -209,7 +209,7 @@ async function pushPending() {
       for (const s of await subsOf(uid)) {
         try {
           const urgent = n.type === 'urgent_alert';
-          await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, JSON.stringify({ title: n.title, body: n.body, link: n.link || '/', tag: n.id, urgent }), { TTL: urgent ? 3600 : 12 * 3600, urgency: urgent ? 'high' : 'normal' });
+          await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, JSON.stringify({ title: n.title, body: n.body, link: n.link || '/', tag: n.alertId ? `alert-${n.alertId}` : n.id, urgent }), { TTL: urgent ? 3600 : 12 * 3600, urgency: urgent ? 'high' : 'normal' });
           stats.pushes++;
         } catch (e) {
           if (e.statusCode === 404 || e.statusCode === 410) {
