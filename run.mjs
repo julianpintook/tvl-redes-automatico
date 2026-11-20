@@ -70,7 +70,7 @@ async function remindOnce(key, to, title, body, link, category = null) {
 async function reminders() {
   // Eventos
   const events = await snap(db.collection('events').where('date', '>=', addDays(TODAY, -1)).where('date', '<=', TOMORROW));
-  for (const e of events) {
+  for (const e of events.filter((x) => x.status !== 'pending')) {
     const who = e.assigneeIds || [];
     const detail = `${e.start ? `${e.start}${e.end ? ` a ${e.end}` : ''} hs` : 'Horario a confirmar'}${e.location ? ` · ${e.location}` : ''}\nCuentas: ${(e.accounts || []).join(', ')}`;
     if (e.date === TOMORROW && NOW.hour >= 9) await remindOnce(`event_${e.id}_${e.date}_manana`, who, `Mañana: ${e.name}`, detail, '/eventos', 'eventos');
@@ -158,7 +158,7 @@ async function loadScheduleData(from, to) {
       vacations,
       defaults,
     });
-  return { vacations, events: events.filter((e) => (e.endDate || e.date) >= from && e.date <= to), reps, holidayBy, shiftOf };
+  return { vacations, events: events.filter((e) => e.status !== 'pending' && (e.endDate || e.date) >= from && e.date <= to), reps, holidayBy, shiftOf };
 }
 
 async function weeklySummary() {
