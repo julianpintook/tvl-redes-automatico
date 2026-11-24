@@ -480,6 +480,7 @@ async function cleanup() {
     ['alerts', 'createdAt', 60], // alertas de último momento de más de 2 meses
     ['mail', 'createdAt', 30], // correos ya despachados
     ['reminders_sent', 'at', 180], // marcas internas de recordatorios
+    ['client_errors', 'at', 60], // errores de pantalla ya viejos
   ];
   for (const [col, field, days] of rules) {
     for (let round = 0; round < 5; round++) {
