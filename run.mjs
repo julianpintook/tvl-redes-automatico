@@ -43,6 +43,12 @@ const TODAY = NOW.date;
 const TOMORROW = addDays(TODAY, 1);
 const fmt = (iso, opts = { weekday: 'long', day: 'numeric', month: 'long' }) => new Date(`${iso}T12:00:00-03:00`).toLocaleDateString('es-AR', { timeZone: TZ, ...opts });
 
+// Registro de tareas periódicas ya hechas (GitHub a veces demora horas entre pasadas).
+const stateRef = db.collection('worker_state').doc('main');
+const STATE = (await stateRef.get()).data() || {};
+const markDone = (k, v) => stateRef.set({ [k]: v }, { merge: true });
+const HOUR_KEY = `${TODAY}T${String(NOW.hour).padStart(2, '0')}`;
+
 const stats = { backupDocs: 0, cleaned: 0, reminders: 0, pushes: 0, pushFail: 0, subsRemoved: 0, calendars: 0 };
 
 // ---- Datos ----
@@ -388,13 +394,14 @@ async function postitReminders() {
     if (!p.time || p.lastFired === TODAY) continue;
     const [h, m] = p.time.split(':').map(Number);
     const diff = nowMin - (h * 60 + m);
-    if (diff < 0 || diff > 90) continue; // si el proceso se demoró más de 90 min, no avisa tarde
+    if (diff < 0) continue; // todavía no es la hora (si el proceso se demoró, avisa igual ese mismo día)
+    const late = diff > 20;
     const rep = p.repeat || 'once';
     if (rep === 'once' && p.date !== TODAY) continue;
     if (rep === 'weekdays' && (dk === 'sat' || dk === 'sun')) continue;
     if (rep === 'weekly' && !(p.days || []).includes(dk)) continue;
     const text = String(p.text || '');
-    await db.collection('notifications').doc().set({ userId: p.ownerId, type: 'postit', title: `📌 ${text.length > 70 ? `${text.slice(0, 67)}…` : text}`, body: text.length > 70 ? text : 'Tu recordatorio de ahora.', link: '/', read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() });
+    await db.collection('notifications').doc().set({ userId: p.ownerId, type: 'postit', title: `📌 ${text.length > 70 ? `${text.slice(0, 67)}…` : text}`, body: `${text.length > 70 ? text : 'Tu recordatorio'}${late ? ` (era para las ${p.time})` : ''}`, link: '/', read: false, emailSent: false, createdAt: FieldValue.serverTimestamp() });
     await db.collection('postits').doc(p.id).update({ lastFired: TODAY });
     stats.reminders++;
   }
@@ -440,8 +447,8 @@ async function dumpCollection(ref) {
   return out;
 }
 async function backup() {
-  const sunday = new Date(`${TODAY}T12:00:00-03:00`).getUTCDay() === 0;
-  const due = (sunday && NOW.hour === 3 && NOW.minute < 5) || process.env.FORCE_BACKUP;
+  // Una vez por semana (la primera pasada pasados 7 días de la última copia), o si se fuerza.
+  const due = !STATE.lastBackup || STATE.lastBackup <= addDays(TODAY, -7) || process.env.FORCE_BACKUP;
   if (!GIST_TOKEN || !due) return;
   const files = {};
   for (const c of await db.listCollections()) files[`ultimo/${c.id}.json`] = JSON.stringify(await dumpCollection(c));
@@ -457,13 +464,15 @@ async function backup() {
   const newTree = await gistApi('POST', `/repos/${BACKUP_REPO}/git/trees`, { base_tree: parent.tree.sha, tree });
   const commit = await gistApi('POST', `/repos/${BACKUP_REPO}/git/commits`, { message: `Copia de seguridad ${TODAY}`, tree: newTree.sha, parents: [parent.sha] });
   await gistApi('PATCH', `/repos/${BACKUP_REPO}/git/refs/heads/main`, { sha: commit.sha });
+  await markDone('lastBackup', TODAY);
 }
 
 // ---------------- Limpieza diaria ----------------
 // Solo cosas de paso: avisos, mensajes del chat, alertas, correos ya enviados y marcas de recordatorios.
 // Nunca toca grilla, eventos, vacaciones, horas extras, comprobantes ni nada de gestión.
 async function cleanup() {
-  if (!(NOW.hour === 4 && NOW.minute < 5) && !process.env.FORCE_CLEANUP) return;
+  // Una vez por día (la primera pasada del día), o si se fuerza.
+  if (STATE.lastCleanup === TODAY && !process.env.FORCE_CLEANUP) return;
   const ago = (days) => admin.firestore.Timestamp.fromDate(new Date(Date.now() - days * 864e5));
   const rules = [
     ['notifications', 'createdAt', 90], // avisos de más de 3 meses
@@ -482,6 +491,7 @@ async function cleanup() {
       stats.cleaned += docs.length;
     }
   }
+  await markDone('lastCleanup', TODAY);
 }
 
 // ---------------- Comunicados programados ----------------
@@ -517,7 +527,8 @@ async function scheduledAnnouncements() {
 // el día 1 de cada mes se deja registrada la última ejecución en este mismo repositorio.
 async function keepAlive() {
   const repo = process.env.GITHUB_REPOSITORY;
-  if (!GIST_TOKEN || !repo || Number(TODAY.slice(8)) !== 1 || NOW.hour !== 4 || NOW.minute >= 5) return;
+  // Una vez por mes.
+  if (!GIST_TOKEN || !repo || STATE.lastKeepAlive === TODAY.slice(0, 7)) return;
   const path = `/repos/${repo}/contents/ultima-actividad.txt`;
   let sha;
   try {
@@ -526,13 +537,14 @@ async function keepAlive() {
     /* todavía no existe */
   }
   await gistApi('PUT', path, { message: `Actividad ${TODAY}`, content: Buffer.from(`Última actividad: ${TODAY}\n`).toString('base64'), sha });
+  await markDone('lastKeepAlive', TODAY.slice(0, 7));
 }
 
 const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
-  // Calendarios: una vez por hora (en la primera pasada de cada hora) o si se fuerza.
-  if ((k === 'calendars' || k === 'syncDevices') && NOW.minute >= 10 && !process.env.FORCE_CALENDARS) continue;
+  // Calendarios y dispositivos: una vez por hora como máximo (la primera pasada de cada hora) o si se fuerza.
+  if ((k === 'calendars' || k === 'syncDevices') && STATE.calendarsHour === HOUR_KEY && !process.env.FORCE_CALENDARS) continue;
   try {
     await fn();
   } catch (e) {
@@ -540,6 +552,7 @@ for (const [k, fn] of Object.entries(steps)) {
     console.error(`Error en ${k}: ${e.message}`);
   }
 }
+if (STATE.calendarsHour !== HOUR_KEY) await markDone('calendarsHour', HOUR_KEY);
 console.log(`Hora AR ${TODAY} ${NOW.hhmm} · recordatorios ${stats.reminders} · push ${stats.pushes} (fallidos ${stats.pushFail}, bajas ${stats.subsRemoved}) · calendarios ${stats.calendars} · respaldo ${stats.backupDocs} docs · limpieza ${stats.cleaned}`);
 await Promise.all(admin.apps.map((a) => a.delete()));
 if (failed) process.exit(1);
