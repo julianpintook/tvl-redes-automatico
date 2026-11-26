@@ -247,7 +247,7 @@ async function performance() {
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
 const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
 async function loadScheduleData(from, to) {
-  const [schedules, weekendCfg, holidays, vacations, events, reps, settings] = await Promise.all([
+  const [schedules, weekendCfg, holidays, vacations, events, reps, settings, assignments] = await Promise.all([
     snap(db.collection('schedules')),
     snap(db.collection('weekend_config')),
     snap(db.collection('holidays').where('date', '>=', from)),
@@ -255,6 +255,7 @@ async function loadScheduleData(from, to) {
     snap(db.collection('events').where('date', '>=', addDays(from, -7))),
     snap(db.collection('replacements').where('endDate', '>=', from)),
     db.collection('settings').doc('shifts').get(),
+    snap(db.collection('assignments').where('endDate', '>=', from)),
   ]);
   const scheduleById = Object.fromEntries(schedules.map((x) => [x.id, x]));
   const weekendBy = Object.fromEntries(weekendCfg.map((w) => [w.id, w]));
@@ -269,6 +270,7 @@ async function loadScheduleData(from, to) {
       weekendConfig: weekendBy[uid],
       holiday: holidayBy[d],
       vacations,
+      assignments,
       defaults,
     });
   return { vacations, events: events.filter((e) => e.status !== 'pending' && (e.endDate || e.date) >= from && e.date <= to), reps, holidayBy, shiftOf };
