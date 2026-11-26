@@ -167,6 +167,83 @@ async function projectDocReminders() {
   }
 }
 
+// ---------------- 1c) Rendimiento: resumen mensual e inactividad (solo al jefe) ----------------
+const fmtDur = (sec) => {
+  const m = Math.round((sec || 0) / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`;
+};
+const INACTIVE_DAYS = 3;
+async function performance() {
+  const ownerUid = (await db.collection('settings').doc('owner').get()).data()?.uid;
+  if (!ownerUid) return;
+  const staff = team.filter((u) => u.id !== ownerUid); // el jefe se mide pero no entra en el ranking
+
+  // Resumen del mes anterior: el 1° de cada mes (o la primera pasada del mes), desde las 9.
+  if (NOW.hour >= 9) {
+    const [y, m] = TODAY.split('-').map(Number);
+    const prev = m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`;
+    const [py, pm] = prev.split('-').map(Number);
+    const prev2 = pm === 1 ? `${py - 1}-12` : `${py}-${String(pm - 1).padStart(2, '0')}`;
+    const key = `perf_month_${prev}`;
+    // Se mide desde noviembre de 2026: no hay resumen de meses sin datos.
+    if (prev >= '2026-11' && !(await db.collection('reminders_sent').doc(key).get()).exists) {
+      const rows = await snap(db.collection('app_time').where('date', '>=', `${prev2}-01`).where('date', '<', `${TODAY.slice(0, 7)}-01`));
+      const sum = (month) => {
+        const by = Object.fromEntries(staff.map((u) => [u.id, 0]));
+        rows.filter((r) => r.date.startsWith(month) && r.uid in by).forEach((r) => (by[r.uid] += r.seconds || 0));
+        return by;
+      };
+      const cur = sum(prev);
+      const before = sum(prev2);
+      const ranking = staff.map((u) => ({ u, s: cur[u.id], d: cur[u.id] - before[u.id] })).sort((a, b) => b.s - a.s);
+      const used = ranking.filter((r) => r.s > 0);
+      const medal = ['🥇', '🥈', '🥉'];
+      const top = used.slice(0, 5).map((r, i) => `${medal[i] || `${i + 1}.`} ${r.u.displayName}: ${fmtDur(r.s)}`).join('\n');
+      const up = [...used].sort((a, b) => b.d - a.d)[0];
+      const down = [...ranking].sort((a, b) => a.d - b.d)[0];
+      const zero = ranking.filter((r) => !r.s).map((r) => r.u.firstName || r.u.displayName);
+      const monthName = new Date(`${prev}-15T12:00:00`).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+      const body = [
+        used.length ? `Más tiempo activo en la app:\n${top}` : 'Nadie usó la app este mes.',
+        up && up.d > 0 ? `📈 El que más creció: ${up.u.displayName} (+${fmtDur(up.d)} que el mes anterior)` : '',
+        down && down.d < 0 ? `📉 El que más bajó: ${down.u.displayName} (${fmtDur(-down.d)} menos)` : '',
+        zero.length ? `😴 No entraron: ${zero.join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      await remindOnce(key, [ownerUid], `📊 Rendimiento de ${monthName}`, body, '/admin/rendimiento');
+    }
+  }
+
+  // Aviso si alguien pasa más de 3 días sin abrir la app (salvo que esté de vacaciones o con el día pedido).
+  if (NOW.hour >= 10) {
+    const presence = Object.fromEntries((await snap(db.collection('presence'))).map((p) => [p.id, p.at?.toDate?.()]));
+    const vac = (await snap(db.collection('vacations').where('endDate', '>=', TODAY))).filter((v) => v.status === 'approved');
+    const off = await snap(db.collection('day_requests').where('date', '==', TODAY));
+    const fresh = []; // un solo aviso con todas las personas nuevas en la lista
+    for (const u of staff) {
+      const seen = presence[u.id];
+      if (!seen) continue; // nunca entró: eso se ve en el panel de uso
+      const seenDay = seen.toLocaleDateString('en-CA', { timeZone: TZ });
+      const days = Math.round((Date.parse(`${TODAY}T12:00:00Z`) - Date.parse(`${seenDay}T12:00:00Z`)) / 86400000);
+      if (days < INACTIVE_DAYS) continue;
+      if (vac.some((v) => v.userId === u.id && v.startDate <= TODAY)) continue;
+      if (off.some((d) => d.userId === u.id && d.status === 'approved')) continue;
+      const key = `inactive_${u.id}_${seenDay}`;
+      if ((await db.collection('reminders_sent').doc(key).get()).exists) continue;
+      fresh.push({ key, u, days, seenDay });
+    }
+    if (fresh.length) {
+      const title = fresh.length === 1 ? `😴 ${fresh[0].u.displayName} no entra a la app hace ${fresh[0].days} días` : `😴 ${fresh.length} personas no entran a la app hace ${INACTIVE_DAYS} días o más`;
+      const body = fresh.map((x) => `${x.u.displayName}: última vez el ${fmt(x.seenDay, { weekday: 'long', day: 'numeric', month: 'numeric' })}`).join('\n');
+      await remindOnce(`inactive_batch_${TODAY}_${fresh.map((x) => x.u.id).join('').slice(0, 60)}`, [ownerUid], title, body, '/admin/rendimiento');
+      const b = db.batch();
+      fresh.forEach((x) => b.set(db.collection('reminders_sent').doc(x.key), { at: FieldValue.serverTimestamp(), count: 1 }));
+      await b.commit();
+    }
+  }
+}
+
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
 const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
 async function loadScheduleData(from, to) {
@@ -569,7 +646,7 @@ async function keepAlive() {
   await markDone('lastKeepAlive', TODAY.slice(0, 7));
 }
 
-const steps = { reminders, projectDocReminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
+const steps = { reminders, projectDocReminders, performance, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios y dispositivos: una vez por hora como máximo (la primera pasada de cada hora) o si se fuerza.
