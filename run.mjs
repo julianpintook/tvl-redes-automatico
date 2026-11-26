@@ -139,6 +139,34 @@ async function reminders() {
   }
 }
 
+// ---------------- 1a) Documentos de proyectos: fecha de ejecución y de publicación ----------------
+// Ejecución: 7, 3 y 1 día antes y el mismo día. Publicación: 1 día antes y el mismo día.
+// Solo a los integrantes del proyecto.
+const daysTo = (iso) => Math.round((Date.parse(`${iso}T12:00:00Z`) - Date.parse(`${TODAY}T12:00:00Z`)) / 86400000);
+const WHEN = (n) => (n === 0 ? 'Hoy' : n === 1 ? 'Mañana' : `En ${n} días`);
+async function projectDocReminders() {
+  if (NOW.hour < 8) return;
+  const projects = (await snap(db.collection('projects'))).filter((p) => p.status === 'approved');
+  for (const p of projects) {
+    const who = (p.memberIds || []).filter((id) => byUid[id]?.status === 'approved');
+    if (!who.length) continue;
+    const docs = await snap(db.collection('projects').doc(p.id).collection('items').where('type', '==', 'doc'));
+    for (const d of docs) {
+      const link = `/proyectos/${p.id}/documento/${d.id}`;
+      if (d.executionDate) {
+        const n = daysTo(d.executionDate);
+        if ([7, 3, 1, 0].includes(n))
+          await remindOnce(`pdoc_${p.id}_${d.id}_ej_${d.executionDate}_${n}`, who, `📝 ${WHEN(n)} hay que hacer: ${d.name}`, `Proyecto «${p.name}» · fecha de ejecución: ${fmt(d.executionDate)}.`, link, 'proyectos');
+      }
+      if (d.publishDate) {
+        const n = daysTo(d.publishDate);
+        if ([1, 0].includes(n))
+          await remindOnce(`pdoc_${p.id}_${d.id}_pub_${d.publishDate}_${n}`, who, `🚀 ${WHEN(n)} se publica: ${d.name}`, `Proyecto «${p.name}» · fecha de publicación: ${fmt(d.publishDate)}.`, link, 'proyectos');
+      }
+    }
+  }
+}
+
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
 const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
 async function loadScheduleData(from, to) {
@@ -541,7 +569,7 @@ async function keepAlive() {
   await markDone('lastKeepAlive', TODAY.slice(0, 7));
 }
 
-const steps = { reminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
+const steps = { reminders, projectDocReminders, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios y dispositivos: una vez por hora como máximo (la primera pasada de cada hora) o si se fuerza.
