@@ -14,6 +14,7 @@ import { MONTHS, daysUntil, nextBirthday } from './lib/birthdays.js';
 import { periodLabel, periodOf, periodRange } from './lib/overtime.js';
 import { findGaps, gapText } from './lib/gaps.js';
 import { wantsPush } from './lib/notifPrefs.js';
+import { uncoveredAccounts } from './lib/accountCoverage.js';
 
 const TZ = 'America/Argentina/Buenos_Aires';
 const APP_URL = 'https://tvl-redes.web.app';
@@ -242,6 +243,43 @@ async function performance() {
       await b.commit();
     }
   }
+}
+
+// ---------------- 1d) Horas extras sugeridas: aviso apenas termina la cobertura ----------------
+async function overtimeSuggestions() {
+  const list = await snap(db.collection('overtime_suggestions').where('status', '==', 'pending'));
+  for (const x of list) {
+    if (x.notified || !x.date || !x.end) continue;
+    const endDay = x.end <= x.start ? addDays(x.date, 1) : x.date;
+    const ready = endDay < TODAY || (endDay === TODAY && NOW.hhmm >= x.end);
+    if (!ready) continue;
+    await remindOnce(`otsug_${x.id}`, [x.userId], '¿Cargamos estas horas extras?', `${x.reason} · ${fmt(x.date, { weekday: 'long', day: 'numeric', month: 'numeric' })} de ${x.start} a ${x.end}. Confirmalas con un toque.`, '/horas-extras', 'horas');
+    await db.collection('overtime_suggestions').doc(x.id).update({ notified: true });
+  }
+}
+
+// ---------------- 1e) Cuentas sin cubrir (aviso al jefe, próximos 3 días) ----------------
+async function accountCoverage() {
+  if (NOW.hour < 9) return;
+  const ownerUid = (await db.collection('settings').doc('owner').get()).data()?.uid;
+  if (!ownerUid) return;
+  const dates = [0, 1, 2, 3].map((n) => addDays(TODAY, n));
+  const { reps, shiftOf } = await loadScheduleData(TODAY, dates[3]);
+  const list = uncoveredAccounts({ dates, team, shiftOf, replacements: reps });
+  const fresh = [];
+  for (const g of list) {
+    const key = `uncovered_${g.date}_${g.account.replace(/[^a-z0-9]/gi, '')}`;
+    if ((await db.collection('reminders_sent').doc(key).get()).exists) continue;
+    fresh.push({ ...g, key });
+  }
+  if (!fresh.length) return;
+  const when = (d) => (d === TODAY ? 'hoy' : d === addDays(TODAY, 1) ? 'mañana' : fmt(d, { weekday: 'long', day: 'numeric' }));
+  const body = fresh.map((g) => `${g.account} ${when(g.date)}: ${g.absent.map((a) => `${name(a.uid)} (${SHIFTS[a.shift]?.label.toLowerCase()})`).join(', ')}`).join('\n');
+  const title = fresh.length === 1 ? `⚠️ ${fresh[0].account} queda sin cubrir ${when(fresh[0].date)}` : `⚠️ ${fresh.length} cuentas quedan sin cubrir`;
+  await remindOnce(`uncovered_batch_${TODAY}_${NOW.hour}_${fresh.length}`, [ownerUid], title, `${body}\nAsigná un reemplazo desde Vacaciones u Horarios.`, '/vacaciones');
+  const b = db.batch();
+  fresh.forEach((g) => b.set(db.collection('reminders_sent').doc(g.key), { at: FieldValue.serverTimestamp(), count: 1 }));
+  await b.commit();
 }
 
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
@@ -648,7 +686,7 @@ async function keepAlive() {
   await markDone('lastKeepAlive', TODAY.slice(0, 7));
 }
 
-const steps = { reminders, projectDocReminders, performance, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
+const steps = { reminders, projectDocReminders, performance, overtimeSuggestions, accountCoverage, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios y dispositivos: una vez por hora como máximo (la primera pasada de cada hora) o si se fuerza.
