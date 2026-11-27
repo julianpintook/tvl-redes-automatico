@@ -282,6 +282,54 @@ async function accountCoverage() {
   await b.commit();
 }
 
+// ---------------- 1f) Proyectos: cápsulas de los cronogramas y documentos con fecha ----------------
+const STAGE_LABEL = { producir: 'Producir', grabar: 'Grabar', editar: 'Editar', publicar: 'Publicar' };
+let projectWorkCache = null;
+async function loadProjectWork() {
+  if (projectWorkCache) return projectWorkCache;
+  const capsules = [];
+  const docs = [];
+  const projects = (await snap(db.collection('projects'))).filter((p) => p.status === 'approved');
+  for (const p of projects) {
+    const ref = db.collection('projects').doc(p.id);
+    const items = await snap(ref.collection('items'));
+    const names = Object.fromEntries(items.map((i) => [i.id, i.name]));
+    items.filter((i) => i.type === 'doc').forEach((d) => docs.push({ ...d, pid: p.id, projectName: p.name, memberIds: p.memberIds || [] }));
+    for (const b of await snap(ref.collection('boards'))) {
+      if (!names[b.id]) continue;
+      Object.entries(b.rows || {}).forEach(([rowId, r]) => {
+        if (r.date && (r.desc || r.c1 || r.c2 || r.c3)) capsules.push({ ...r, rowId, bid: b.id, pid: p.id, boardName: names[b.id], projectName: p.name });
+      });
+    }
+  }
+  projectWorkCache = { capsules, docs };
+  return projectWorkCache;
+}
+const stagesOf = (c) => [c.c1, c.c2, c.c3].filter(Boolean).map((k) => STAGE_LABEL[k]).filter(Boolean);
+
+// Avisos de cápsulas: a los participantes, el día anterior (desde las 9) y el mismo día (desde las 8).
+async function capsuleReminders() {
+  if (NOW.hour < 8) return;
+  const { capsules } = await loadProjectWork();
+  for (const c of capsules) {
+    if (c.status === 'cancelado' || c.status === 'conseguido') continue;
+    const who = [c.p1, c.p2].filter((uid) => uid && byUid[uid]?.status === 'approved');
+    if (!who.length) continue;
+    const when = c.date === TODAY ? 'hoy' : c.date === TOMORROW && NOW.hour >= 9 ? 'manana' : null;
+    if (!when) continue;
+    const st = stagesOf(c);
+    const what = `${st.length ? st.join(' · ') : 'Cápsula'}${c.desc ? `: ${c.desc.slice(0, 80)}` : ''}`;
+    await remindOnce(
+      `caps_${c.bid}_${c.rowId}_${c.date}_${when}`,
+      who,
+      `💊 ${when === 'hoy' ? 'Hoy' : 'Mañana'} te toca ${what}`,
+      `${c.boardName} · proyecto «${c.projectName}»${c.p1 && c.p2 ? `\nCon ${name(c.p1)} y ${name(c.p2)}` : ''}`,
+      `/proyectos/${c.pid}/cronograma/${c.bid}?mes=${c.date.slice(0, 7)}`,
+      'proyectos'
+    );
+  }
+}
+
 // ---------------- 1b) Resumen de la semana (lunes) ----------------
 const DAY_SHORT = { mon: 'Lun', tue: 'Mar', wed: 'Mié', thu: 'Jue', fri: 'Vie', sat: 'Sáb', sun: 'Dom' };
 async function loadScheduleData(from, to) {
@@ -319,6 +367,7 @@ async function weeklySummary() {
   if (TODAY !== weekStart || NOW.hour < 8) return;
   const weekEnd = addDays(weekStart, 6);
   const data = await loadScheduleData(weekStart, weekEnd);
+  const pw = await loadProjectWork();
   for (const u of team) {
     const lines = [];
     let anything = false;
@@ -340,7 +389,18 @@ async function weeklySummary() {
     data.reps
       .filter((r) => r.replacementUserId === u.id && r.startDate <= weekEnd)
       .forEach((r) => lines.push(`Reemplazás a ${name(r.absentUserId)} hasta el ${Number(r.endDate.slice(8))}/${Number(r.endDate.slice(5, 7))}`));
-    if (!anything && !ev.length) continue;
+    // Cápsulas y documentos de la semana en sus proyectos.
+    const dm = (d) => `${Number(d.slice(8))}/${Number(d.slice(5, 7))}`;
+    const work = [];
+    work.push(...pw.capsules.filter((c) => (c.p1 === u.id || c.p2 === u.id) && c.date >= weekStart && c.date <= weekEnd && c.status !== 'cancelado').map((c) => [c.date, `💊 ${dm(c.date)}: ${stagesOf(c).join(' · ') || 'Cápsula'}${c.desc ? ` · ${c.desc.slice(0, 60)}` : ''}`]));
+    pw.docs
+      .filter((d) => d.memberIds.includes(u.id))
+      .forEach((d) => {
+        if (d.executionDate >= weekStart && d.executionDate <= weekEnd) work.push([d.executionDate, `📝 ${dm(d.executionDate)}: hacer «${d.name}»`]);
+        if (d.publishDate >= weekStart && d.publishDate <= weekEnd) work.push([d.publishDate, `🚀 ${dm(d.publishDate)}: publicar «${d.name}»`]);
+      });
+    work.sort((a, b) => a[0].localeCompare(b[0])).forEach(([, t]) => lines.push(t));
+    if (!anything && !ev.length && !work.length) continue;
     await remindOnce(`semana_${weekStart}_${u.id}`, [u.id], 'Tu semana', lines.join('\n'), '/grilla', 'resumen');
   }
 }
@@ -686,7 +746,7 @@ async function keepAlive() {
   await markDone('lastKeepAlive', TODAY.slice(0, 7));
 }
 
-const steps = { reminders, projectDocReminders, performance, overtimeSuggestions, accountCoverage, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
+const steps = { reminders, projectDocReminders, capsuleReminders, performance, overtimeSuggestions, accountCoverage, holidayEve, gapAlerts, taskHandover, postitReminders, weeklySummary, pushPending, calendars, syncDevices, backup, cleanup, keepAlive, scheduledAnnouncements };
 let failed = false;
 for (const [k, fn] of Object.entries(steps)) {
   // Calendarios y dispositivos: una vez por hora como máximo (la primera pasada de cada hora) o si se fuerza.
